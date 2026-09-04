@@ -1,0 +1,10 @@
+transaction_id,customer_id,amount,location,device,payment_method,hour,status
+TXN1001,CUST001,25000,Hyderabad,Android,Credit Card,14,completed
+TXN1002,CUST001,1200,Hyderabad,Android,UPI,10,completed
+TXN1003,CUST001,850,Hyderabad,Android,UPI,19,completed
+TXN1004,CUST002,75000,Bengaluru,Windows,Laptop,2,completed
+TXN1005,CUST003,450,Chennai,iPhone,UPI,11,completed
+TXN1006,CUST001,950,Hyderabad,Android,UPI,12,completed
+TXN1007,CUST001,1800,Hyderabad,Android,Credit Card,16,completed
+TXN1008,CUST001,1100,Hyderabad,Android,UPI,9,completed
+TXN1009,CUST001,100000,Mumbai,Web,NetBanking,3,completed
