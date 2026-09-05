@@ -54,13 +54,21 @@ def add_audit_event(state: RiskGraphState, event: str) -> List[str]:
         return current
     return [*current, event]
 
-load_dotenv()
-
-llm = ChatGoogleGenerativeAI(
-    model="gemini-3.6-flash",
-    google_api_key=os.getenv("GEMINI_API_KEY"),
-    max_retries=2
-)
+def get_google_api_key() -> Optional[str]:
+    """Retrieve Gemini API key from environment variables or Streamlit secrets safely."""
+    key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+    if key and key.strip():
+        return key.strip()
+    try:
+        import streamlit as st
+        if hasattr(st, "secrets"):
+            if "GEMINI_API_KEY" in st.secrets:
+                return str(st.secrets["GEMINI_API_KEY"]).strip()
+            elif "GOOGLE_API_KEY" in st.secrets:
+                return str(st.secrets["GOOGLE_API_KEY"]).strip()
+    except Exception:
+        pass
+    return None
 
 SYSTEM_PROMPT = """
 You are RiskGuard's Autonomous Risk Investigation Agent.
@@ -89,21 +97,41 @@ IMPORTANT RULES:
 14. The LLM is an investigator and explainer. The deterministic system owns the score, level, and policy action.
 """
 
-agent = create_agent(
-    model=llm,
-    tools=[
-        get_transaction,
-        get_customer_history,
-        get_device_history,
-        calculate_velocity_risk,
-        get_customer_profile,
-        get_device_profile,
-        calculate_behavioral_risk,
-        calculate_real_ml_risk,
-        get_shap_explanation
-    ],
-    system_prompt=SYSTEM_PROMPT
-)
+class DummyAgent:
+    def invoke(self, *args, **kwargs):
+        raise ValueError("GEMINI_API_KEY is not configured in environment or Streamlit secrets.")
+
+def create_gemini_agent():
+    api_key = get_google_api_key()
+    if not api_key:
+        return None, DummyAgent()
+    try:
+        model = ChatGoogleGenerativeAI(
+            model="gemini-3.6-flash",
+            google_api_key=api_key,
+            max_retries=2
+        )
+        ag = create_agent(
+            model=model,
+            tools=[
+                get_transaction,
+                get_customer_history,
+                get_device_history,
+                calculate_velocity_risk,
+                get_customer_profile,
+                get_device_profile,
+                calculate_behavioral_risk,
+                calculate_real_ml_risk,
+                get_shap_explanation
+            ],
+            system_prompt=SYSTEM_PROMPT
+        )
+        return model, ag
+    except Exception as e:
+        print(f"[RiskGuard Agent Warning] Could not initialize ChatGoogleGenerativeAI: [{type(e).__name__}] {e}")
+        return None, DummyAgent()
+
+llm, agent = create_gemini_agent()
 
 def build_deterministic_investigation_report(transaction_id: str) -> str:
     tx_data = get_transaction_by_id(transaction_id)
@@ -197,6 +225,7 @@ def build_deterministic_investigation_report(transaction_id: str) -> str:
     return "\n".join(report_lines)
 
 def investigation_agent_node(state: RiskGraphState) -> RiskGraphState:
+    global llm, agent
     transaction_id = state["transaction_id"]
 
     audit_log = add_audit_event(state, f"Investigation started for transaction {transaction_id}")
@@ -206,7 +235,14 @@ def investigation_agent_node(state: RiskGraphState) -> RiskGraphState:
     investigation = ""
 
     try:
-        result = agent.invoke({
+        current_agent = agent
+        if current_agent is None or isinstance(current_agent, DummyAgent):
+            _, real_agent = create_gemini_agent()
+            if real_agent is not None and not isinstance(real_agent, DummyAgent):
+                agent = real_agent
+                current_agent = real_agent
+
+        result = current_agent.invoke({
             "messages": [{
                 "role": "user",
                 "content": (
