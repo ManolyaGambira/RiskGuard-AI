@@ -1,9 +1,10 @@
+import os
 from typing import TypedDict, Optional, List
 from risk_schema import RiskAssessment
 from policy_engine import determine_action
 from dotenv import load_dotenv
 # pyrefly: ignore [missing-import]
-from langchain_groq import ChatGroq
+from langchain_google_genai import ChatGoogleGenerativeAI
 # pyrefly: ignore [missing-import]
 from langchain.agents import create_agent
 # pyrefly: ignore [missing-import]
@@ -31,7 +32,9 @@ from ml_risk_calculator import calculate_behavioral_risk
 from real_ml_risk_calculator import calculate_real_ml_risk
 from shap_tools import get_shap_explanation
 from risk_fusion import fuse_risk_evidence, map_score_to_level
-from transaction_data import get_transaction_by_id
+from transaction_data import get_transaction_by_id, get_customer_transactions
+from velocity_engine import calculate_velocity_risk as calc_velocity
+from anomaly_engine import calculate_anomaly_score as calc_anomaly
 
 class RiskGraphState(TypedDict, total=False):
     transaction_id: str
@@ -40,6 +43,7 @@ class RiskGraphState(TypedDict, total=False):
     risk_level: str
     system_action: str
     human_decision: Optional[str]
+    final_disposition: Optional[str]
     audit_log: List[str]
     consistency_warning: Optional[str]
 
@@ -52,9 +56,10 @@ def add_audit_event(state: RiskGraphState, event: str) -> List[str]:
 
 load_dotenv()
 
-llm = ChatGroq(
-    model="openai/gpt-oss-20b",
-    temperature=0
+llm = ChatGoogleGenerativeAI(
+    model="gemini-3.6-flash",
+    google_api_key=os.getenv("GEMINI_API_KEY"),
+    max_retries=2
 )
 
 SYSTEM_PROMPT = """
@@ -100,11 +105,105 @@ agent = create_agent(
     system_prompt=SYSTEM_PROMPT
 )
 
+def build_deterministic_investigation_report(transaction_id: str) -> str:
+    tx_data = get_transaction_by_id(transaction_id)
+    if not tx_data:
+        return f"Transaction ID '{transaction_id}' not found in RiskGuard record index."
+
+    cust_id = tx_data.get("customer_id", "UNKNOWN")
+    amount = float(tx_data.get("amount", 0.0))
+    location = tx_data.get("location", "UNKNOWN")
+    device = tx_data.get("device", "UNKNOWN")
+    payment_method = tx_data.get("payment_method", "UNKNOWN")
+    source = tx_data.get("source", "demo")
+
+    cust_history = get_customer_transactions(cust_id)
+    past_history = [h for h in cust_history if h.get("transaction_id") != transaction_id]
+
+    beh_output = calculate_behavioral_risk.invoke(transaction_id)
+    beh_score = 0
+    beh_level = "LOW"
+    for line in beh_output.splitlines():
+        if line.startswith("Behavioral Risk Score:"):
+            beh_score = int(line.split(":")[1].split("/")[0].strip())
+        elif line.startswith("Behavioral Risk Level:"):
+            beh_level = line.split(":")[1].strip()
+
+    vel_res = calc_velocity(tx_data, past_history)
+    anom_res = calc_anomaly(tx_data)
+
+    ml_score = None
+    ml_level = None
+    shap_text = None
+    if source == "benchmark" or str(transaction_id).upper().startswith("BENCH-"):
+        ml_output = calculate_real_ml_risk.invoke(transaction_id)
+        for line in ml_output.splitlines():
+            if line.startswith("ML Risk Score:"):
+                ml_score = int(line.split(":")[1].split("/")[0].strip())
+            elif line.startswith("ML Risk Level:"):
+                ml_level = line.split(":")[1].strip()
+
+        shap_text = get_shap_explanation.invoke(transaction_id)
+
+    history_status = "insufficient_history" if "insufficient_history" in beh_output else "available"
+    fusion = fuse_risk_evidence(
+        ml_score=ml_score,
+        behavioral_score=beh_score,
+        velocity_score=vel_res.get("velocity_score", 0),
+        anomaly_score=anom_res.get("anomaly_score", 0),
+        history_status=history_status
+    )
+    score = fusion["fused_risk_score"]
+    level = fusion["risk_level"]
+    action = determine_action(RiskAssessment(risk_score=score, risk_level=level, recommendation="", reasons=[]))
+
+    report_lines = [
+        "### INVESTIGATION SUMMARY",
+        f"Verified RiskGuard deterministic risk analysis performed for transaction **{transaction_id}**. "
+        f"Transaction amount **₹{amount:,.2f}** initiated by customer **{cust_id}** via **{device}** from **{location}**.",
+        "",
+        "### VERIFIED SIGNALS",
+        f"• **Transaction ID**: {transaction_id}",
+        f"• **Customer ID**: {cust_id} ({len(past_history)} past transactions in record)",
+        f"• **Amount**: ₹{amount:,.2f} | **Device**: {device} | **Location**: {location} | **Payment Method**: {payment_method}",
+        f"• **Behavioral Risk Score**: {beh_score}/100 ({beh_level})",
+        f"• **Velocity Score**: {vel_res.get('velocity_score', 0)}/100 | **Statistical Anomaly Score**: {anom_res.get('anomaly_score', 0)}/100",
+        ""
+    ]
+
+    if ml_score is not None:
+        first_shap_line = shap_text.splitlines()[0] if shap_text else 'Anonymized model features V1-V28 evaluated'
+        report_lines.extend([
+            "### ML EVIDENCE",
+            f"• **XGBoost Fraud Risk Score**: {ml_score}/100 ({ml_level})",
+            f"• **SHAP Feature Attribution**: {first_shap_line}",
+            ""
+        ])
+    else:
+        report_lines.extend([
+            "### ML EVIDENCE",
+            "• **Demo Transaction**: Rule-based behavioral & velocity risk engines active",
+            ""
+        ])
+
+    report_lines.extend([
+        "### RISK ASSESSMENT",
+        f"**{level} — {score}/100**",
+        "",
+        "### RECOMMENDED ACTION",
+        f"**{action}**"
+    ])
+
+    return "\n".join(report_lines)
+
 def investigation_agent_node(state: RiskGraphState) -> RiskGraphState:
     transaction_id = state["transaction_id"]
 
     audit_log = add_audit_event(state, f"Investigation started for transaction {transaction_id}")
     save_audit_event(transaction_id, f"Investigation started for transaction {transaction_id}")
+
+    is_llm_fallback = False
+    investigation = ""
 
     try:
         result = agent.invoke({
@@ -120,32 +219,36 @@ def investigation_agent_node(state: RiskGraphState) -> RiskGraphState:
             }]
         })
 
-        investigation = ""
-        for message in reversed(result["messages"]):
+        for message in reversed(result.get("messages", [])):
             content = getattr(message, "content", None)
+            # Skip messages that only contain tool calls without final response text
+            if hasattr(message, "tool_calls") and message.tool_calls and not content:
+                continue
+
             if isinstance(content, str) and content.strip():
                 investigation = content.strip()
                 break
             elif isinstance(content, list):
                 parts = [b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"]
-                if parts:
-                    investigation = "\n".join(parts).strip()
+                text_content = "\n".join([p for p in parts if p.strip()]).strip()
+                if text_content:
+                    investigation = text_content
                     break
 
-        if not investigation:
-            investigation = "Investigation completed. No anomaly detected."
-    except Exception:
-        investigation = (
-            "AI investigation temporarily unavailable. Deterministic risk analysis remains active.\n\n"
-            "System-Generated Deterministic Evidence Summary:\n"
-            f"- Transaction ID: {transaction_id}\n"
-            "- Authoritative deterministic calculations and policy rules remain fully operational below.\n"
-            "- Risk score, risk level, and policy decisions are governed by deterministic rules and are unaffected by LLM availability."
-        )
+        if not investigation or "temporarily unavailable" in investigation.lower():
+            print(f"[RiskGuard Agent] Gemini response unavailable or empty for {transaction_id}. Using deterministic report.")
+            investigation = build_deterministic_investigation_report(transaction_id)
+            is_llm_fallback = True
+
+    except Exception as e:
+        print(f"[RiskGuard Agent Error] Gemini investigation failed for {transaction_id}: [{type(e).__name__}] {e}")
+        investigation = build_deterministic_investigation_report(transaction_id)
+        is_llm_fallback = True
 
     return {
         **state,
         "investigation": investigation,
+        "is_llm_fallback": is_llm_fallback,
         "audit_log": audit_log
     }
 
@@ -243,15 +346,25 @@ def human_review_node(state: RiskGraphState) -> RiskGraphState:
         "options": ["APPROVE", "REJECT"]
     })
 
+    human_dec_str = f"APPROVED BY HUMAN" if decision == "APPROVE" else f"REJECTED BY HUMAN"
+    final_disp_str = f"APPROVED AFTER HUMAN REVIEW" if decision == "APPROVE" else f"REJECTED AFTER HUMAN REVIEW"
+
     audit_log = add_audit_event(
         {**state, "audit_log": audit_log},
-        f"Human decision recorded: {decision}"
+        f"Human decision recorded: {human_dec_str}"
     )
-    save_audit_event(state["transaction_id"], f"Human decision recorded: {decision}")
+    save_audit_event(state["transaction_id"], f"Human decision recorded: {human_dec_str}")
+
+    audit_log = add_audit_event(
+        {**state, "audit_log": audit_log},
+        f"Final disposition: {final_disp_str}"
+    )
+    save_audit_event(state["transaction_id"], f"Final disposition: {final_disp_str}")
 
     return {
         **state,
         "human_decision": decision,
+        "final_disposition": final_disp_str,
         "audit_log": audit_log
     }
 

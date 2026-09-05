@@ -2,4 +2,7 @@
 venv/
 __pycache__/
 *.db
+scratch/
+*.npz
 data/real/creditcard.csv
+!data/real/creditcard.csv.gz

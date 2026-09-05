@@ -36,7 +36,8 @@ class TestRiskGraph(unittest.TestCase):
         state = {"transaction_id": "TXN1009"}
         res = investigation_agent_node(state)
         inv = res.get("investigation", "")
-        self.assertIn("AI investigation temporarily unavailable", inv)
+        self.assertIn("INVESTIGATION SUMMARY", inv)
+        self.assertIn("VERIFIED SIGNALS", inv)
         self.assertNotIn("Rate limit reached", inv)
         self.assertNotIn("200000", inv)
 

@@ -54,13 +54,30 @@ def run_batch_risk_screening(batch_size: int = 1000, start_index: int = 0) -> Di
     rec = float(recall_score(y_true, batch_df["predicted_fraud"], zero_division=0))
     f1 = float(f1_score(y_true, batch_df["predicted_fraud"], zero_division=0))
     
+    from audit_storage import save_audit_event
+    from policy_engine import determine_action
+    from risk_schema import RiskAssessment
+
+    for idx, row in batch_df.iterrows():
+        row_idx = int(idx)
+        tx_id = f"BENCH-{row_idx + 1:06d}"
+        batch_id = f"BATCH-{row_idx + 1:06d}"
+        s_score = int(row["risk_score"])
+        s_level = str(row["risk_level"]).strip().upper()
+        s_action = determine_action(RiskAssessment(risk_score=s_score, risk_level=s_level, recommendation="", reasons=[]))
+
+        save_audit_event(tx_id, f"Batch Screening Completed: Score {s_score}/100 ({s_level})")
+        save_audit_event(tx_id, f"Policy decision: {s_action}")
+        save_audit_event(batch_id, f"Batch Screening Completed: Score {s_score}/100 ({s_level})")
+        save_audit_event(batch_id, f"Policy decision: {s_action}")
+
     # Top suspicious transactions formatted for risk queue
     top_suspicious_df = batch_df[batch_df["risk_score"] >= 40].sort_values("risk_score", ascending=False).head(50)
     top_suspicious_list = []
     for idx, row in top_suspicious_df.iterrows():
         tx_dict = normalize_benchmark_row(int(idx), row)
         tx_dict["ml_risk_score"] = int(row["risk_score"])
-        tx_dict["risk_level"] = row["risk_level"]
+        tx_dict["risk_level"] = str(row["risk_level"]).strip().upper()
         tx_dict["fraud_probability"] = float(row["fraud_probability"])
         top_suspicious_list.append(tx_dict)
 

@@ -59,15 +59,23 @@ def save_audit_event(transaction_id: str, event: str):
 
 def get_audit_events(transaction_id: str):
     connection = sqlite3.connect(DB_FILE)
+    tx_str = str(transaction_id).strip()
+
+    alt_id = None
+    if tx_str.upper().startswith("BATCH-"):
+        alt_id = "BENCH-" + tx_str[6:]
+    elif tx_str.upper().startswith("BENCH-"):
+        alt_id = "BATCH-" + tx_str[6:]
 
     cursor = connection.execute(
         """
         SELECT event, timestamp
         FROM audit_events
-        WHERE transaction_id = ?
+        WHERE UPPER(transaction_id) = UPPER(?)
+        OR (? IS NOT NULL AND UPPER(transaction_id) = UPPER(?))
         ORDER BY id ASC
         """,
-        (transaction_id,),
+        (tx_str, alt_id, alt_id if alt_id else ""),
     )
 
     events = cursor.fetchall()

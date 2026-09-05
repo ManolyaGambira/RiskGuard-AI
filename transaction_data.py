@@ -6,13 +6,21 @@ from typing import Dict, Any, List, Optional
 BASE_DIR = Path(__file__).parent
 DEMO_CSV = BASE_DIR / "data" / "transactions.csv"
 REAL_CSV = BASE_DIR / "data" / "real" / "creditcard.csv"
+REAL_CSV_GZ = BASE_DIR / "data" / "real" / "creditcard.csv.gz"
 
 _benchmark_df_cache: Optional[pd.DataFrame] = None
 
 def get_benchmark_df() -> pd.DataFrame:
     global _benchmark_df_cache
     if _benchmark_df_cache is None:
-        _benchmark_df_cache = pd.read_csv(REAL_CSV)
+        if REAL_CSV.exists():
+            _benchmark_df_cache = pd.read_csv(REAL_CSV)
+        elif REAL_CSV_GZ.exists():
+            _benchmark_df_cache = pd.read_csv(REAL_CSV_GZ)
+        else:
+            raise FileNotFoundError(
+                f"Benchmark dataset not found at {REAL_CSV} or {REAL_CSV_GZ}."
+            )
     return _benchmark_df_cache
 
 def load_demo_transactions() -> List[Dict[str, Any]]:
@@ -150,3 +158,81 @@ def get_benchmark_batch(limit: int = 1000, start_index: int = 0) -> List[Dict[st
     for idx in range(start_index, end_index):
         batch.append(normalize_benchmark_row(idx, df.iloc[idx]))
     return batch
+
+def get_operational_risk_queue() -> List[Dict[str, Any]]:
+    """
+    Build prioritized operational risk queue from demo transactions and public benchmark predictions.
+    Selection is STRICTLY based on predicted risk score, risk level, and policy action.
+    Ground-truth dataset labels (Class) are NEVER used for queue membership.
+    """
+    from real_ml_risk_calculator import model, FEATURES
+    from risk_fusion import map_score_to_level
+    from policy_engine import determine_action
+    from risk_schema import RiskAssessment
+    from ml_risk_calculator import calculate_behavioral_risk
+
+    queue_items = []
+
+    # 1. Demo transactions
+    demos = load_demo_transactions()
+    for d in demos:
+        tx_id = d["transaction_id"]
+        beh_output = calculate_behavioral_risk.invoke(tx_id)
+        r_score = 0
+        r_level = "LOW"
+        for line in beh_output.splitlines():
+            if line.startswith("Behavioral Risk Score:"):
+                r_score = int(line.split(":")[1].split("/")[0].strip())
+            elif line.startswith("Behavioral Risk Level:"):
+                r_level = line.split(":")[1].strip()
+
+        r_action = determine_action(RiskAssessment(risk_score=r_score, risk_level=r_level, recommendation="", reasons=[]))
+
+        if r_level in ["MEDIUM", "HIGH", "CRITICAL"] and r_action != "APPROVE":
+            queue_items.append({
+                "transaction_id": tx_id,
+                "customer_id": d["customer_id"],
+                "amount": float(d["amount"]),
+                "risk_score": r_score,
+                "risk_level": r_level,
+                "action": r_action,
+                "source": "demo"
+            })
+
+    # 2. Public benchmark transactions (using predicted XGBoost scores ONLY)
+    df = get_benchmark_df()
+    sample_df = df.iloc[:10000].copy()
+    probs = model.predict_proba(sample_df[FEATURES])[:, 1]
+    scores = (probs * 100).round().astype(int)
+
+    sample_df["predicted_score"] = scores
+    sample_df["predicted_level"] = [map_score_to_level(s) for s in scores]
+
+    # Select genuine benchmark predicted cases per risk level category
+    crit_rows = sample_df[sample_df["predicted_level"] == "CRITICAL"].head(2)
+    high_rows = sample_df[sample_df["predicted_level"] == "HIGH"].head(3)
+    med_rows = sample_df[sample_df["predicted_level"] == "MEDIUM"].head(3)
+
+    benchmark_candidates = pd.concat([crit_rows, high_rows, med_rows])
+
+    for idx, row in benchmark_candidates.iterrows():
+        tx_dict = normalize_benchmark_row(int(idx), row)
+        score = int(row["predicted_score"])
+        level = row["predicted_level"]
+        action = determine_action(RiskAssessment(risk_score=score, risk_level=level, recommendation="", reasons=[]))
+
+        if level in ["MEDIUM", "HIGH", "CRITICAL"] and action != "APPROVE":
+            queue_items.append({
+                "transaction_id": tx_dict["transaction_id"],
+                "customer_id": tx_dict["customer_id"],
+                "amount": tx_dict["amount"],
+                "risk_score": score,
+                "risk_level": level,
+                "action": action,
+                "source": "benchmark"
+            })
+
+    severity_order = {"CRITICAL": 3, "HIGH": 2, "MEDIUM": 1, "LOW": 0}
+    queue_items.sort(key=lambda x: (severity_order.get(x["risk_level"], 0), x["risk_score"]), reverse=True)
+    return queue_items
+

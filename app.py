@@ -11,7 +11,8 @@ from transaction_data import (
     get_customer_transactions,
     get_device_transactions,
     load_demo_transactions,
-    get_benchmark_df
+    get_benchmark_df,
+    get_operational_risk_queue
 )
 from risk_graph import risk_graph
 from risk_fusion import map_score_to_level, fuse_risk_evidence
@@ -51,6 +52,26 @@ else:
 # =========================================================
 # SESSION STATE INITIALIZATION
 # =========================================================
+
+NAV_PAGES = [
+    "◉ Overview",
+    "▶ Live Transaction Stream",
+    "🔎 Risk Explorer",
+    "🚨 Risk Queue",
+    "⚡ Batch Analysis",
+    "📊 Model Performance",
+    "📜 Audit Trail",
+    "🟢 System Health"
+]
+
+if "current_page" not in st.session_state:
+    st.session_state.current_page = "◉ Overview"
+
+if st.session_state.current_page not in NAV_PAGES:
+    st.session_state.current_page = "◉ Overview"
+
+if "sidebar_nav_select" not in st.session_state:
+    st.session_state.sidebar_nav_select = st.session_state.current_page
 
 if "investigated_transaction" not in st.session_state:
     st.session_state.investigated_transaction = "TXN1009"
@@ -278,9 +299,8 @@ header[data-testid="stHeader"] {
 </style>
 """)
 
-# =========================================================
-# SIDEBAR NAVIGATION
-# =========================================================
+# Sync sidebar radio widget key with current_page state before render
+st.session_state.sidebar_nav_select = st.session_state.current_page
 
 with st.sidebar:
     st.html("""
@@ -294,18 +314,17 @@ with st.sidebar:
     """)
     st.divider()
 
+    def on_nav_change():
+        st.session_state.current_page = st.session_state.sidebar_nav_select
+
+    default_idx = NAV_PAGES.index(st.session_state.current_page)
+
     nav_choice = st.radio(
         "Navigation",
-        [
-            "◉ Overview",
-            "▶ Live Transaction Stream",
-            "🔎 Risk Explorer",
-            "🚨 Risk Queue",
-            "⚡ Batch Analysis",
-            "📊 Model Performance",
-            "📜 Audit Trail",
-            "🟢 System Health"
-        ],
+        NAV_PAGES,
+        index=default_idx,
+        key="sidebar_nav_select",
+        on_change=on_nav_change,
         label_visibility="collapsed"
     )
 
@@ -316,6 +335,7 @@ with st.sidebar:
     st.success("● SQLite Audit Trail: Connected")
     st.caption("DATASET TRANSPARENCY")
     st.info("Public Credit Card Fraud Benchmark (284,807 transactions) loaded for evaluation & batch scaling.")
+
 
 # =========================================================
 # HEADER
@@ -396,7 +416,7 @@ if nav_choice == "◉ Overview":
 
 elif nav_choice == "▶ Live Transaction Stream":
     st.markdown("### Simulated Real-Time Transaction Stream")
-    st.caption("Replaying transactions from the public credit card benchmark dataset with real-time ML risk scoring.")
+    st.caption("Replaying transactions from the public historical credit card benchmark dataset with real-time ML risk scoring.")
 
     col1, col2, col3 = st.columns([1, 1, 2])
     with col1:
@@ -410,26 +430,41 @@ elif nav_choice == "▶ Live Transaction Stream":
                 st.rerun()
 
     with col2:
-        speed = st.selectbox("Stream Speed", ["1 tx/sec", "5 tx/sec", "10 tx/sec"])
+        speed_choice = st.selectbox(
+            "Stream Speed",
+            ["1 tx/sec", "2 tx/sec", "5 tx/sec"],
+            index=0,
+            key="stream_speed_select"
+        )
+        speed_map = {
+            "1 tx/sec": 1.0,
+            "2 tx/sec": 0.5,
+            "5 tx/sec": 0.2
+        }
+        run_interval = speed_map.get(speed_choice, 1.0)
 
     with col3:
         if st.button("🗑 CLEAR STREAM HISTORY"):
             st.session_state.stream_events = []
             st.rerun()
 
-    if st.session_state.stream_active:
-        sim = st.session_state.stream_simulator
-        event = sim.next_event()
-        st.session_state.stream_events.insert(0, event)
-        if len(st.session_state.stream_events) > 50:
-            st.session_state.stream_events.pop()
+    @st.fragment(run_every=run_interval if st.session_state.stream_active else None)
+    def render_stream_fragment():
+        if st.session_state.stream_active:
+            sim = st.session_state.stream_simulator
+            event = sim.next_event()
+            st.session_state.stream_events.insert(0, event)
+            if len(st.session_state.stream_events) > 50:
+                st.session_state.stream_events.pop()
 
-    if st.session_state.stream_events:
-        df_stream = pd.DataFrame(st.session_state.stream_events)
-        display_cols = ["timestamp", "transaction_id", "customer_id", "amount", "location", "device", "risk_score", "risk_level"]
-        st.dataframe(df_stream[display_cols], use_container_width=True)
-    else:
-        st.info("Stream is currently paused. Click 'START STREAM' to begin real-time ingestion simulation.")
+        if st.session_state.stream_events:
+            df_stream = pd.DataFrame(st.session_state.stream_events)
+            display_cols = ["timestamp", "transaction_id", "customer_id", "amount", "location", "device", "risk_score", "risk_level"]
+            st.dataframe(df_stream[display_cols], use_container_width=True)
+        else:
+            st.info("Stream is currently paused. Click 'START STREAM' to begin real-time ingestion simulation.")
+
+    render_stream_fragment()
 
 # =========================================================
 # VIEW 3: RISK EXPLORER
@@ -566,20 +601,51 @@ elif nav_choice == "🔎 Risk Explorer":
                 </html>
                 """, height=0, width=0)
 
-        st.html(f"""
-        <div style="padding:22px; border-radius:18px; background:rgba(15,23,42,0.85); border:1px solid rgba(148,163,184,0.15); margin-bottom:20px;">
-            <div style="display:flex; justify-content:space-between; align-items:center;">
-                <div>
-                    <span style="color:#94a3b8; font-size:12px; font-weight:700;">TRANSACTION</span>
-                    <div style="font-size:26px; font-weight:800;">{tx_id}</div>
-                </div>
-                <div style="text-align:right;">
-                    <span class="risk-badge {badge_class}" style="font-size:16px;">{level} ({score}/100)</span>
-                    <div style="color:#94a3b8; font-size:13px; margin-top:4px;">Deterministic Policy Action: <strong>{action}</strong></div>
-                </div>
+        # Determine 4 distinct operational status fields
+        if st.session_state.human_decision == "APPROVE":
+            h_dec_str = "APPROVED BY HUMAN"
+            f_disp_str = "APPROVED AFTER HUMAN REVIEW"
+        elif st.session_state.human_decision == "REJECT":
+            h_dec_str = "REJECTED BY HUMAN"
+            f_disp_str = "REJECTED AFTER HUMAN REVIEW"
+        elif st.session_state.awaiting_human_review:
+            h_dec_str = "PENDING HUMAN REVIEW"
+            f_disp_str = "PAUSED FOR HUMAN REVIEW"
+        else:
+            h_dec_str = "NOT REQUIRED"
+            f_disp_str = "AUTOMATICALLY APPROVED" if action == "APPROVE" else action
+
+        m_col1, m_col2, m_col3, m_col4 = st.columns(4)
+        with m_col1:
+            st.html(f"""
+            <div class="metric-card">
+                <div class="metric-label">Risk Assessment</div>
+                <div style="margin-top:4px;"><span class="risk-badge {badge_class}">{level} ({score}/100)</span></div>
             </div>
-        </div>
-        """)
+            """)
+        with m_col2:
+            st.html(f"""
+            <div class="metric-card">
+                <div class="metric-label">System Policy</div>
+                <div class="metric-value" style="font-size:16px; color:#e2e8f0; margin-top:4px;">{action}</div>
+            </div>
+            """)
+        with m_col3:
+            h_color = "#4ade80" if "APPROVED" in h_dec_str else ("#f87171" if "REJECTED" in h_dec_str else ("#facc15" if "PENDING" in h_dec_str else "#94a3b8"))
+            st.html(f"""
+            <div class="metric-card">
+                <div class="metric-label">Human Decision</div>
+                <div style="font-size:14px; font-weight:700; color:{h_color}; margin-top:6px;">{h_dec_str}</div>
+            </div>
+            """)
+        with m_col4:
+            f_color = "#4ade80" if "APPROVED" in f_disp_str else ("#f87171" if "REJECTED" in f_disp_str else ("#facc15" if "PAUSED" in f_disp_str else "#60a5fa"))
+            st.html(f"""
+            <div class="metric-card">
+                <div class="metric-label">Final Disposition</div>
+                <div style="font-size:14px; font-weight:700; color:{f_color}; margin-top:6px;">{f_disp_str}</div>
+            </div>
+            """)
 
         t1, t2, t3, t4, t5 = st.tabs([
             "📋 Verified Facts",
@@ -594,15 +660,14 @@ elif nav_choice == "🔎 Risk Explorer":
 
         with t2:
             inv_text = res.get("investigation", "") if res else ""
-            if "temporarily unavailable" in inv_text.lower():
-                st.warning("⚠️ AI investigation temporarily unavailable. Deterministic risk analysis remains active.")
-                st.markdown("##### System-Generated Deterministic Evidence Summary")
-                st.info(inv_text)
-            elif inv_text:
-                st.markdown("#### Autonomous AI Investigation Report")
-                st.markdown(inv_text)
+            is_fallback = res.get("is_llm_fallback", False) if res else False
+
+            if is_fallback or "INVESTIGATION SUMMARY" in inv_text:
+                st.caption("ℹ️ Gemini unavailable — deterministic investigation shown.")
             else:
-                st.info("Click 'INVESTIGATE' to trigger autonomous LangGraph investigation.")
+                st.caption("🤖 Autonomous AI Agent Investigation Narrative (Powered by Gemini & LangChain)")
+
+            st.markdown(inv_text)
 
         with t3:
             if tx_data.get("source") == "benchmark" or str(tx_id).upper().startswith("BENCH-"):
@@ -661,9 +726,9 @@ elif nav_choice == "🔎 Risk Explorer":
 
         if st.session_state.human_decision:
             if st.session_state.human_decision == "APPROVE":
-                st.success("Human decision recorded: APPROVE")
+                st.success("✅ **Human Decision Recorded**: APPROVED BY HUMAN — **Final Disposition**: APPROVED AFTER HUMAN REVIEW")
             else:
-                st.error("Human decision recorded: REJECT")
+                st.error("❌ **Human Decision Recorded**: REJECTED BY HUMAN — **Final Disposition**: REJECTED AFTER HUMAN REVIEW")
     else:
         st.error(f"Transaction ID '{tx_id}' not found.")
 
@@ -673,37 +738,29 @@ elif nav_choice == "🔎 Risk Explorer":
 
 elif nav_choice == "🚨 Risk Queue":
     st.markdown("### Prioritized Risk Investigation Queue")
-    st.caption("Transactions requiring analyst review ordered by risk severity.")
+    st.caption("Transactions requiring analyst review or monitoring ordered by risk severity.")
 
-    demos = load_demo_transactions()
-    queue_items = []
-    for d in demos:
-        tx_id = d["transaction_id"]
-        res = risk_graph.invoke({"transaction_id": tx_id}, config={"configurable": {"thread_id": f"queue-{tx_id}"}})
-        queue_items.append({
-            "transaction_id": tx_id,
-            "customer_id": d["customer_id"],
-            "amount": float(d["amount"]),
-            "risk_score": res.get("risk_score", 0),
-            "risk_level": res.get("risk_level", "LOW"),
-            "action": res.get("system_action", "APPROVE")
-        })
+    queue_items = get_operational_risk_queue()
 
-    df_queue = pd.DataFrame(queue_items).sort_values("risk_score", ascending=False)
+    if queue_items:
+        df_queue = pd.DataFrame(queue_items)
 
-    for _, row in df_queue.iterrows():
-        l_str = row["risk_level"]
-        b_class = f"risk-badge-{l_str.lower()}"
-        col1, col2, col3 = st.columns([3, 2, 1])
-        with col1:
-            st.markdown(f"**{row['transaction_id']}** — Customer {row['customer_id']} (₹{row['amount']:,.2f})")
-        with col2:
-            st.html(f"<span class='risk-badge {b_class}'>{l_str} ({row['risk_score']}/100)</span> → {row['action']}")
-        with col3:
-            if st.button("Inspect", key=f"q_{row['transaction_id']}"):
-                st.session_state.investigated_transaction = row["transaction_id"]
-                st.rerun()
-        st.divider()
+        for _, row in df_queue.iterrows():
+            l_str = row["risk_level"]
+            b_class = f"risk-badge-{l_str.lower()}"
+            col1, col2, col3 = st.columns([3, 2, 1])
+            with col1:
+                st.markdown(f"**{row['transaction_id']}** — Customer {row['customer_id']} (₹{row['amount']:,.2f})")
+            with col2:
+                st.html(f"<span class='risk-badge {b_class}'>{l_str} ({row['risk_score']}/100)</span> → {row['action']}")
+            with col3:
+                if st.button("Inspect", key=f"q_{row['transaction_id']}"):
+                    st.session_state.investigated_transaction = row["transaction_id"]
+                    st.session_state.current_page = "🔎 Risk Explorer"
+                    st.rerun()
+            st.divider()
+    else:
+        st.info("No transactions currently require analyst review or monitoring.")
 
 # =========================================================
 # VIEW 5: BATCH ANALYSIS
@@ -737,7 +794,28 @@ elif nav_choice == "⚡ Batch Analysis":
 
             st.markdown("#### Risk Distribution Breakdown")
             dist = b_res["risk_distribution"]
-            st.bar_chart(pd.DataFrame([dist]))
+            total_screened = b_res["total_transactions"]
+            
+            # Batch consistency check: sum of category counts equals total screened
+            sum_counts = dist.get("CRITICAL", 0) + dist.get("HIGH", 0) + dist.get("MEDIUM", 0) + dist.get("LOW", 0)
+            assert sum_counts == total_screened, f"Category sum ({sum_counts}) must equal total screened ({total_screened})"
+
+            bc1, bc2, bc3, bc4 = st.columns(4)
+            with bc1: st.markdown(f"🔴 **CRITICAL**: `{dist.get('CRITICAL', 0):,}`")
+            with bc2: st.markdown(f"🟠 **HIGH**: `{dist.get('HIGH', 0):,}`")
+            with bc3: st.markdown(f"🟡 **MEDIUM**: `{dist.get('MEDIUM', 0):,}`")
+            with bc4: st.markdown(f"🟢 **LOW**: `{dist.get('LOW', 0):,}`")
+
+            chart_df = pd.DataFrame({
+                "Risk Level": ["CRITICAL", "HIGH", "MEDIUM", "LOW"],
+                "Transaction Count": [
+                    dist.get("CRITICAL", 0),
+                    dist.get("HIGH", 0),
+                    dist.get("MEDIUM", 0),
+                    dist.get("LOW", 0)
+                ]
+            }).set_index("Risk Level")
+            st.bar_chart(chart_df, use_container_width=True)
 
             st.markdown("#### Top Prioritized Suspicious Transactions")
             if b_res["top_suspicious_transactions"]:
@@ -752,34 +830,80 @@ elif nav_choice == "📊 Model Performance":
     st.markdown("### Machine Learning Model Performance & Cost Tradeoff")
     st.caption("Evaluated on unseen held-out test set (56,962 transactions) from the public credit card benchmark.")
 
-    m1, m2, m3, m4 = st.columns(4)
-    with m1: st.metric("Precision", f"{model_metrics['precision']*100:.2f}%")
-    with m2: st.metric("Recall", f"{model_metrics['recall']*100:.2f}%")
-    with m3: st.metric("F1 Score", f"{model_metrics['f1']*100:.2f}%")
-    with m4: st.metric("PR-AUC", f"{model_metrics['pr_auc']*100:.2f}%")
+    st.info("ℹ️ **Evaluation Sandbox Only** — Adjusting the classification threshold simulates model classification metrics on the held-out test set (56,962 transactions). It does NOT modify production risk policy thresholds or live transaction risk scoring.")
 
-    st.markdown("### Confusion Matrix")
+    thresh = st.slider("Classification Threshold", min_value=0.10, max_value=0.90, value=0.50, step=0.05)
+
+    npz_path = Path(__file__).parent / "data" / "test_set_eval.npz"
+    if npz_path.exists():
+        import numpy as np
+        eval_data = np.load(npz_path)
+        y_true = eval_data["y_test"]
+        probs = eval_data["probs"]
+
+        preds = (probs >= thresh).astype(int)
+        tp = int(np.sum((preds == 1) & (y_true == 1)))
+        tn = int(np.sum((preds == 0) & (y_true == 0)))
+        fp = int(np.sum((preds == 1) & (y_true == 0)))
+        fn = int(np.sum((preds == 0) & (y_true == 1)))
+
+        precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+        accuracy = (tp + tn) / len(y_true)
+        fpr = fp / (fp + tn) if (fp + tn) > 0 else 0.0
+        fnr = fn / (fn + tp) if (fn + tp) > 0 else 0.0
+    else:
+        precision = model_metrics.get("precision", 0.7810)
+        recall = model_metrics.get("recall", 0.8367)
+        f1 = model_metrics.get("f1", 0.8079)
+        accuracy = model_metrics.get("accuracy", 0.9993)
+        tp = model_metrics.get("true_positives", 82)
+        tn = model_metrics.get("true_negatives", 56841)
+        fp = model_metrics.get("false_positives", 23)
+        fn = model_metrics.get("false_negatives", 16)
+        fpr = fp / (fp + tn)
+        fnr = fn / (fn + tp)
+
+    roc_auc = model_metrics.get("roc_auc", 0.9804)
+    pr_auc = model_metrics.get("pr_auc", 0.8662)
+
+    st.markdown(f"#### Evaluation Metrics at Threshold {thresh:.2f}")
+    m1, m2, m3, m4 = st.columns(4)
+    with m1: st.metric("Precision (Threshold)", f"{precision*100:.2f}%")
+    with m2: st.metric("Recall (Threshold)", f"{recall*100:.2f}%")
+    with m3: st.metric("F1 Score (Threshold)", f"{f1*100:.2f}%")
+    with m4: st.metric("PR-AUC (Fixed)", f"{pr_auc*100:.2f}%")
+
+    m5, m6, m7, m8 = st.columns(4)
+    with m5: st.metric("Accuracy (Threshold)", f"{accuracy*100:.4f}%")
+    with m6: st.metric("False Positive Rate (FPR)", f"{fpr*100:.4f}%")
+    with m7: st.metric("False Negative Rate (FNR)", f"{fnr*100:.2f}%")
+    with m8: st.metric("ROC-AUC (Fixed)", f"{roc_auc*100:.2f}%")
+
+    st.markdown(f"### Confusion Matrix at Threshold {thresh:.2f}")
     cm_df = pd.DataFrame(
-        [[model_metrics["true_negatives"], model_metrics["false_positives"]],
-         [model_metrics["false_negatives"], model_metrics["true_positives"]]],
-        index=["Actual Legitimate", "Actual Fraud"],
-        columns=["Predicted Legitimate", "Predicted Fraud"]
+        [[tn, fp],
+         [fn, tp]],
+        index=["Actual Legitimate (0)", "Actual Fraud (1)"],
+        columns=["Predicted Legitimate (0)", "Predicted Fraud (1)"]
     )
     st.dataframe(cm_df, use_container_width=True)
 
-    st.markdown("### Interactive Threshold & Illustrative Cost Analysis")
-    st.caption("Adjust classification threshold to observe trade-offs between false positives and false negatives.")
+    st.markdown("### Dynamic Illustrative Cost Analysis")
+    st.caption("Adjust hypothetical cost assumptions to calculate trade-offs at the selected classification threshold.")
     
-    thresh = st.slider("Classification Threshold", min_value=0.10, max_value=0.90, value=0.50, step=0.05)
-    
-    c_fp = st.number_input("Hypothetical Cost of False Positive (₹)", value=100)
-    c_fn = st.number_input("Hypothetical Cost of False Negative (₹)", value=5000)
+    col_c1, col_c2 = st.columns(2)
+    with col_c1:
+        c_fp = st.number_input("Hypothetical Cost of False Positive (₹)", value=100, step=10)
+    with col_c2:
+        c_fn = st.number_input("Hypothetical Cost of False Negative (₹)", value=5000, step=500)
 
-    est_fp_cost = model_metrics["false_positives"] * c_fp
-    est_fn_cost = model_metrics["false_negatives"] * c_fn
+    est_fp_cost = fp * c_fp
+    est_fn_cost = fn * c_fn
     total_cost = est_fp_cost + est_fn_cost
 
-    st.info(f"**Illustrative Estimated Total Cost**: ₹{total_cost:,.2f} (FP Cost: ₹{est_fp_cost:,.2f} | FN Cost: ₹{est_fn_cost:,.2f}) — *Configurable illustrative cost assumptions for evaluation.*")
+    st.info(f"**Illustrative Estimated Total Cost**: ₹{total_cost:,.2f}  (FP Cost: {fp} × ₹{c_fp:,} = ₹{est_fp_cost:,.2f}  |  FN Cost: {fn} × ₹{c_fn:,} = ₹{est_fn_cost:,.2f}) — *Threshold {thresh:.2f}*")
 
 # =========================================================
 # VIEW 7: AUDIT TRAIL
@@ -809,7 +933,7 @@ elif nav_choice == "🟢 System Health":
     
     st.success("✓ ML Model (XGBoost): Loaded")
     st.success("✓ Benchmark Dataset (creditcard.csv): 284,807 rows active")
-    st.success("✓ LangGraph Agent: Online (Groq LLM connected)")
+    st.success("✓ LangGraph Agent: Online (Gemini LLM connected)")
     st.success("✓ SQLite Audit Database (riskguard_audit.db): Connected")
     st.success("✓ SHAP Explainer: Ready")
 
